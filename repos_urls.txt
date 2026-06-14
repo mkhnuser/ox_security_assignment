@@ -1,0 +1,2 @@
+https://github.com/OWASP/NodeGoat.git
+https://github.com/OWASP/railsgoat.git
