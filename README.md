@@ -4,7 +4,8 @@
 
 ## Usage
 
-Create `repos_urls.txt` and populate it with the links of the repositories you want to scan:
+Create `repos_urls.txt` and populate
+with the list of links of the repositories you want to scan (a newline separated):
 
     https://github.com/OWASP/NodeGoat.git
     https://github.com/OWASP/railsgoat.git
@@ -34,6 +35,13 @@ For the sake of simplicity, we don't restrict the amount of I/O we generate when
 ### HTTP retries
 
 For the sake of simplicity, we don't do HTTP retries.
+
+### Logging
+
+We might want to use structured logging in the future.
+In the future, we might want to use a separate thread for logging so that the event loop is not blocked:
+
+    https://docs.python.org/3/library/logging.handlers.html#queuehandler
 
 ### Uniform Async Interface
 
@@ -74,5 +82,5 @@ We create .csv file for a long summary.
 # - '0': Clean (no security findings detected)
 #
 #
-# This command: trivy repository --quiet -f table -o scan_result.json --table-mode detailed https://github.com/OWASP/NodeGoat.git
+# This command: trivy repository --quiet -f json -o scan_result.json https://github.com/OWASP/NodeGoat.git
 # Produces a more detailed output.
