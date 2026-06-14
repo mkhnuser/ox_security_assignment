@@ -4,11 +4,12 @@ import asyncio
 import logging
 import pathlib
 import shutil
-from urllib.parse import quote
-
-from typing import Mapping, MutableMapping
+from urllib.parse import quote, unquote
+from collections import Counter
+from typing import Any, Mapping, MutableMapping
 
 import aiohttp
+from pydantic import BaseModel, Field
 
 
 logger = logging.getLogger("root_logger")
@@ -17,17 +18,24 @@ stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
+
+if not logger.handlers:
+    # NOTE: Don't add a handler if a module is imported multiple times.
+    logger.addHandler(stream_handler)
 
 
 GITHUB_REPO_STATISTICS_URL = "https://api.github.com/repos/{owner}/{repo_name}"
-TRIVY_SECURITY_SCAN_COMMAND = (
-    "trivy repository --quiet -f json -o {prefix_path}/{scan_name}.json {repo_url}"
-)
+SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
+
+
+class ScanStatistics(BaseModel):
+    repo_url: str
+    stars: int | None = 0
+    severity_statistics: Mapping[str, int] = Field(default_factory=dict)
+    vulnerability_names: list[str] = Field(default_factory=list)
 
 
 async def obtain_repos_urls() -> list[str]:
-    """Obtain repositories to be scanned from STDIN."""
     repos_urls = []
 
     while True:
@@ -38,7 +46,7 @@ async def obtain_repos_urls() -> list[str]:
 
         repos_urls.append(repo_url)
 
-    logger.info("The total of %d repo URLs has been obtained.", len(repos_urls))
+    logger.info("The total of %d repo URLs have been obtained.", len(repos_urls))
     return repos_urls
 
 
@@ -47,8 +55,6 @@ async def obtain_repo_stars(
     owner: str,
     repo_name: str,
 ) -> int | None:
-    """Obtain the number of stars a given repository has. If there is an error, return the default value."""
-
     url = GITHUB_REPO_STATISTICS_URL.format(owner=owner, repo_name=repo_name)
 
     try:
@@ -67,8 +73,6 @@ async def obtain_repo_stars(
 async def obtain_repo_url_to_stars_mapping(
     repos_urls: list[str],
 ) -> Mapping[str, int | None]:
-    """Obtain a mapping between a repo URL and the number of stars it has."""
-
     repo_url_to_stars_mapping: MutableMapping[str, int | None] = {}
     tasks: list[asyncio.Task] = []
 
@@ -108,7 +112,6 @@ async def run_security_scans(
     artifacts_dir_path: pathlib.Path,
     repos_urls: list[str],
 ) -> None:
-    """Run a security scan on all repo urls."""
     tasks: tuple[asyncio.Task, ...] = tuple(
         asyncio.create_task(
             run_security_scan(
@@ -127,18 +130,26 @@ async def run_security_scan(
     timestamp: str,
     repo_url: str,
 ) -> None:
-    """Run a trivy security scan on a given repo url."""
-
     # NOTE: A path can't contain slashes, so let's quote it.
     safe_repo_url = quote(repo_url, safe="")
-    scan_name = f"{timestamp}-{safe_repo_url}"
+    scan_name = f"{timestamp}-{safe_repo_url}.json"
+    output_path = prefix_path / pathlib.Path(scan_name)
 
-    command = TRIVY_SECURITY_SCAN_COMMAND.format(
-        prefix_path=str(prefix_path).rstrip("/"),
-        scan_name=scan_name,
-        repo_url=repo_url,
+    command = [
+        "trivy",
+        "repository",
+        "--quiet",
+        "-f",
+        "json",
+        "-o",
+        str(output_path),
+        repo_url,
+    ]
+    logger.info(" ".join(command))
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stderr=asyncio.subprocess.PIPE,
     )
-    logger.info(command)
 
     # NOTE:
     # So,
@@ -148,20 +159,15 @@ async def run_security_scan(
     # /security_scanner/artifacts/1781440863.1922567-https%3A%2F%2Fgithub.com%2FOWASP%2FNodeGoat.git.json \
     # https://github.com/OWASP/NodeGoat.git
 
-    process = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
     _, stderr = await process.communicate()
 
-    if stderr:
-        logger.error("%r exited with %s.", command, process.returncode)
-        logger.error("%s", stderr.decode())
+    if process.returncode != 0:
+        logger.error("Trivy exited with %s status code.", process.returncode)
+        if stderr:
+            logger.error("%s", stderr.decode())
 
 
-async def prepare_artifacts_dir() -> pathlib.Path:
+async def recreate_artifacts_dir() -> pathlib.Path:
     logger.debug("Artifacts directory is about to be recreated.")
 
     cwd = pathlib.Path.cwd()
@@ -176,17 +182,81 @@ async def prepare_artifacts_dir() -> pathlib.Path:
     return artifacts_dir_path
 
 
+async def aggregate_the_statistics(
+    repo_url: str,
+    statistics_dict: dict[Any, Any],
+) -> ScanStatistics:
+    scan_statistics = ScanStatistics(repo_url=repo_url)
+    severity_counts = Counter({severity: 0 for severity in SEVERITIES})
+    vulnerability_names = set()
+
+    for result in statistics_dict.get("Results", []):
+        for vulnerability in result.get("Vulnerabilities", []):
+            severity = vulnerability.get("Severity", "UNKNOWN")
+            if severity not in severity_counts:
+                severity = "UNKNOWN"
+
+            severity_counts[severity] += 1
+            name = vulnerability.get("VulnerabilityID") or "UNKNOWN"
+            vulnerability_names.add(name)
+
+    scan_statistics.severity_statistics = dict(severity_counts)
+    scan_statistics.vulnerability_names = sorted(vulnerability_names)
+    return scan_statistics
+
+
+async def obtain_repo_url_to_statistics_mapping(
+    artifacts_dir_path: pathlib.Path,
+) -> MutableMapping[str, ScanStatistics]:
+    repo_url_to_scan_statistics: MutableMapping[str, ScanStatistics] = {}
+
+    for artifact_path in artifacts_dir_path.iterdir():
+        try:
+            with open(str(artifact_path), "rt") as file:
+                statistics_dict = json.load(file)
+        except (OSError, ValueError):
+            logger.error(
+                "There was an error while reading an artifact file.",
+                exc_info=True,
+            )
+            logger.info("The script will continue its execution normally.")
+            continue
+
+        repo_url = artifact_path.stem
+        repo_url = repo_url.split("/")[-1]
+        repo_url = repo_url.split("-", 1)[-1]
+        repo_url = unquote(repo_url)
+        repo_url_to_scan_statistics[repo_url] = await aggregate_the_statistics(
+            repo_url,
+            statistics_dict,
+        )
+
+    return repo_url_to_scan_statistics
+
+
 async def main() -> None:
     repos_urls = await obtain_repos_urls()
     logger.info("The following repositories will be scanned:")
     logger.info(json.dumps(repos_urls, indent=4))
 
-    repo_url_to_stars_mapping = await obtain_repo_url_to_stars_mapping(repos_urls)
-
-    artifacts_dir_path = await prepare_artifacts_dir()
+    artifacts_dir_path = await recreate_artifacts_dir()
     await run_security_scans(artifacts_dir_path, repos_urls)
+    repo_url_to_scan_statistics_mapping = await obtain_repo_url_to_statistics_mapping(
+        artifacts_dir_path,
+    )
+    repo_url_to_stars_mapping = await obtain_repo_url_to_stars_mapping(repos_urls)
+    for repo_url, stars in repo_url_to_stars_mapping.items():
+        # NOTE: At this point, scan_statistics might be not present if a Trivy process has previously failed.
+        scan_statistics = repo_url_to_scan_statistics_mapping.get(repo_url)
+        if scan_statistics is not None:
+            scan_statistics.stars = stars
+
+    for scan_statistics in repo_url_to_scan_statistics_mapping.values():
+        logger.info(scan_statistics.model_dump_json(indent=4))
+
+    logger.info("The security scanner has finished its execution.")
 
 
 if __name__ == "__main__":
-    logger.info("A security scan is about to start.")
+    logger.info("The security scan is about to start.")
     asyncio.run(main())
