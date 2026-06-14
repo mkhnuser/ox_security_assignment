@@ -16,9 +16,24 @@ Run with Docker:
 
 ## Considerations
 
+### Supported Repo Hosting Platforms
+
+We assume that we scan only GitHub repos.
+Further, we assume that we pass a repository URL in a "clone" format:
+
+    https://github.com/OWASP/NodeGoat.git
+
 ### Input
 
 We accept an input as a file for the sake of convenience.
+
+### I/O Limit
+
+For the sake of simplicity, we don't restrict the amount of I/O we generate when it comes to HTTP requests.
+
+### HTTP retries
+
+For the sake of simplicity, we don't do HTTP retries.
 
 ### Uniform Async Interface
 
